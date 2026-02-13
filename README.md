@@ -121,6 +121,14 @@ Either the whole thing commits, or none of it does. No half-baked AI runs left d
 
 The model isn’t magic; it’s an expensive function call that needs rails.
 
+### Where Is The “Thinking Process”?
+
+- The API exposes structured reasoning per message through each message object's `reasoning` field.
+- The `analysis` object provides prospect-level reasoning (insights, hooks, and value framing).
+- The system intentionally does not expose raw chain-of-thought tokens in API responses.
+- Instead, it returns a controlled reasoning summary designed for production-safe transparency.
+- Raw AI responses and deeper reasoning traces are persisted internally in `AIGeneration` for auditability.
+
 ### Model Selection
 
 - **Model**: `gpt-4o-mini` — small, fast, and cheap enough to iterate with.

@@ -279,6 +279,14 @@ PERSONALIZATION & INSIGHT:
 - Each message should include at least one subtle, concrete observation about the prospect's situation, not just flattery.
 - Make each message feel written uniquely for this prospect, not a generic persona.
 
+ANALYSIS GROUNDING RULES:
+- In analysis.prospect_insights, explicitly reference at least one skill from profileData.skills when skills are provided.
+- In analysis.prospect_insights, explicitly reference one likely responsibility inferred from the headline.
+- Do not use generic claims unless directly supported by the provided profile data.
+- In analysis.value_proposition, explicitly connect: (a) the prospect's likely responsibilities, (b) the provided company context, and (c) one concrete operational improvement.
+- Avoid vague phrases like "streamline workflows" unless you name a specific workflow or operational area.
+- Ensure variation across prospects by grounding analysis in the actual provided profile data (headline, company, skills, experience), not reused template phrasing.
+
 INSIGHT-DRIVEN SEQUENCE:
 - Treat this as thoughtful peer outreach: focus on observations, hypotheses, and value, not aggressive pitching.
 - Each message should add a new, specific insight or angle (e.g., a pattern you see in similar companies, a workflow friction they probably have, or a small suggestion).
@@ -289,7 +297,8 @@ SEQUENCE COHERENCE:
 
 STRICT OUTPUT:
 - DO NOT include markdown formatting.
-- DO NOT include any commentary, explanation, or notes outside the JSON structure.`;
+- DO NOT include any commentary, explanation, or notes outside the JSON structure.
+- DO NOT output raw chain-of-thought; keep reasoning concise and limited to the requested fields.`;
 }
 
 function buildUserPrompt(
@@ -321,6 +330,8 @@ SEQUENCE REQUIREMENTS:
 - Tie the company context and value proposition directly to what this prospect likely cares about in their role.
 - Avoid generic outreach templates and clichés.
 - Build a natural progression across the sequence (e.g., initial connection-style message, then context-building, then value-driven follow-ups).
+- In analysis.prospect_insights, include at least one explicit skill from profileData.skills when available and one responsibility inferred from the headline.
+- In analysis.value_proposition, explicitly connect responsibilities + company context + a concrete operational improvement.
 
 Return ONLY the JSON object as specified in the system prompt. Do not add any markdown or commentary.`;
 }

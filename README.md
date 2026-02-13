@@ -467,7 +467,7 @@ npm install
 npm run prisma:generate
 
 # Set up environment variables
-cp .env.example .env
+cp env.example .env
 # Edit .env with your DATABASE_URL and OPENAI_API_KEY
 
 # Run database migrations

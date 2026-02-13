@@ -31,6 +31,10 @@ export interface LinkedInProfile {
   };
 }
 
+export interface EnrichmentProvider {
+  enrichLinkedInProfile(url: string): Promise<LinkedInProfile>;
+}
+
 const COMPANY_SUFFIXES = ['Labs', 'Systems', 'Technologies', 'Solutions', 'Inc'];
 const EXPERIENCE_START_YEARS = [2018, 2019, 2020, 2021, 2022];
 const SCHOOLS = [
@@ -233,4 +237,10 @@ export async function parseLinkedInProfile(url: string): Promise<LinkedInProfile
       summary,
     },
   };
+}
+
+export class MockEnrichmentProvider implements EnrichmentProvider {
+  async enrichLinkedInProfile(url: string): Promise<LinkedInProfile> {
+    return parseLinkedInProfile(url);
+  }
 }

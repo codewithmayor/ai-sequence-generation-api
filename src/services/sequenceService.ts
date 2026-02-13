@@ -1,9 +1,9 @@
-import { generateSequenceSchema, GenerateSequenceInput } from '../utils/validation';
-import { AppError } from '../utils/errorHandler';
+import { generateSequenceSchema } from '../utils/validation';
 import prisma from '../db/prisma';
-import { parseLinkedInProfile } from '../utils/linkedinParser';
+import { EnrichmentProvider } from '../utils/linkedinParser';
 import { translateTovToDescription } from '../utils/tovTranslator';
 import { generateSequenceWithAI, PROMPT_VERSION, MODEL } from './aiService';
+import { getEnrichmentProvider } from './enrichmentProviderFactory';
 
 export interface SequenceResponse {
   analysis: Record<string, any>;
@@ -15,15 +15,22 @@ export interface SequenceResponse {
   confidence: number;
 }
 
+interface SequenceServiceDependencies {
+  enrichmentProvider?: EnrichmentProvider;
+}
+
 /**
  * Main service function for generating or retrieving message sequences.
  * Implements idempotency: if an identical request exists, returns cached result.
  */
 export async function generateSequenceService(
-  input: unknown
+  input: unknown,
+  dependencies: SequenceServiceDependencies = {}
 ): Promise<SequenceResponse> {
   // Validate input
   const validatedInput = generateSequenceSchema.parse(input);
+  const enrichmentProvider =
+    dependencies.enrichmentProvider ?? getEnrichmentProvider();
 
   const { prospect_url, tov_config, company_context, sequence_length } = validatedInput;
 
@@ -55,8 +62,10 @@ export async function generateSequenceService(
     };
   }
 
-  // Parse LinkedIn profile (mock implementation)
-  const profileData = await parseLinkedInProfile(prospect_url);
+  // Parse LinkedIn profile through a swappable enrichment provider.
+  const profileData = await enrichmentProvider.enrichLinkedInProfile(
+    prospect_url
+  );
 
   // Translate TOV to description
   const tovDescription = translateTovToDescription(

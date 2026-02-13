@@ -50,7 +50,8 @@ Response:
 
 - `controllers`: HTTP request/response only
 - `services`: orchestration + AI integration
-- `utils`: validation, TOV translation, LinkedIn mock parser, error middleware
+- `utils`: validation, TOV translation, LinkedIn parsing primitives, error middleware
+- `services/enrichmentProviderFactory.ts`: config-based enrichment provider selection (mock now, provider-backed later)
 - `db/prisma.ts`: Prisma client singleton
 - `prisma/schema.prisma`: relational models + JSONB fields
 
@@ -110,6 +111,7 @@ Data flow:
 
 In a production environment, I would integrate with an official LinkedIn partner API or a compliant enrichment provider such as People Data Labs or Proxycurl.
 For this exercise, I implemented deterministic mock enrichment derived from the LinkedIn slug to simulate realistic profile data while keeping the system architecture production-ready and legally safe.
+The enrichment layer is abstracted behind an `EnrichmentProvider`, so the generation pipeline remains unchanged when swapping implementations.
 
 ### How Mock LinkedIn Parsing Works
 
@@ -167,6 +169,7 @@ npm run prisma:studio
 
 - `DATABASE_URL`
 - `OPENAI_API_KEY`
+- `ENRICHMENT_PROVIDER` (`mock` by default)
 - `PORT` (default `3000`)
 
 ## Tech Stack

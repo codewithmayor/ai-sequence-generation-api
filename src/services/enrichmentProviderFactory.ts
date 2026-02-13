@@ -1,15 +1,20 @@
 import {
-  EnrichmentProvider,
-  MockEnrichmentProvider,
+  ProspectEnrichmentProvider,
+  MockLinkedInProvider,
 } from '../utils/linkedinParser';
 
-let cachedProvider: EnrichmentProvider | null = null;
+let cachedProvider: ProspectEnrichmentProvider | null = null;
 
 /**
  * Resolves the enrichment provider from configuration.
- * This keeps the generation pipeline stable while allowing provider swaps.
+ *
+ * The generation pipeline depends only on ProspectEnrichmentProvider — it never
+ * knows which concrete implementation is active. To add a real LinkedIn provider:
+ *   1. Implement ProspectEnrichmentProvider (map API response → ProspectProfile).
+ *   2. Add a case here for the provider name.
+ *   3. Set ENRICHMENT_PROVIDER=<name> in your environment.
  */
-export function getEnrichmentProvider(): EnrichmentProvider {
+export function getEnrichmentProvider(): ProspectEnrichmentProvider {
   if (cachedProvider) {
     return cachedProvider;
   }
@@ -20,13 +25,13 @@ export function getEnrichmentProvider(): EnrichmentProvider {
 
   switch (configuredProvider) {
     case 'mock':
-      cachedProvider = new MockEnrichmentProvider();
+      cachedProvider = new MockLinkedInProvider();
       break;
     default:
       console.warn(
         `Unknown ENRICHMENT_PROVIDER "${configuredProvider}". Falling back to "mock".`
       );
-      cachedProvider = new MockEnrichmentProvider();
+      cachedProvider = new MockLinkedInProvider();
       break;
   }
 
@@ -36,6 +41,6 @@ export function getEnrichmentProvider(): EnrichmentProvider {
 /**
  * Optional test hook for injecting a provider implementation.
  */
-export function setEnrichmentProvider(provider: EnrichmentProvider): void {
+export function setEnrichmentProvider(provider: ProspectEnrichmentProvider): void {
   cachedProvider = provider;
 }

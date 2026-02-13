@@ -1,7 +1,8 @@
 import { generateSequenceSchema } from '../utils/validation';
 import prisma from '../db/prisma';
-import { EnrichmentProvider } from '../utils/linkedinParser';
+import { ProspectEnrichmentProvider } from '../utils/linkedinParser';
 import { translateTovToDescription } from '../utils/tovTranslator';
+import { computeMessageStrategy } from '../utils/roleContextStrategy';
 import { generateSequenceWithAI, PROMPT_VERSION, MODEL } from './aiService';
 import { getEnrichmentProvider } from './enrichmentProviderFactory';
 
@@ -16,7 +17,7 @@ export interface SequenceResponse {
 }
 
 interface SequenceServiceDependencies {
-  enrichmentProvider?: EnrichmentProvider;
+  enrichmentProvider?: ProspectEnrichmentProvider;
 }
 
 /**
@@ -62,10 +63,40 @@ export async function generateSequenceService(
     };
   }
 
-  // Parse LinkedIn profile through a swappable enrichment provider.
-  const profileData = await enrichmentProvider.enrichLinkedInProfile(
-    prospect_url
-  );
+  // Enrich prospect profile through a swappable enrichment provider.
+  // The provider returns a strongly typed ProspectProfile with roleCategory,
+  // seniority, skills, and inferredResponsibilities — grounding the AI pipeline.
+  const profile = await enrichmentProvider.enrich(prospect_url);
+
+  // --- Role–Context Strategy Engine ---
+  // Derive target role deterministically from company_context,
+  // intersect with capability tags and role-allowed workflows,
+  // and produce a focused MessageStrategy for the AI pipeline.
+  //
+  // IMPORTANT: We do NOT remap the profile. The prospect keeps their authentic
+  // identity (skills, headline, title). The strategy only adapts WHICH frictions
+  // to surface and HOW to frame the value — preventing grounding drift.
+  const strategy = computeMessageStrategy(company_context, profile.roleCategory);
+
+  // Log alignment diagnostics — prospectRole and targetPersona stay separate.
+  // The profile keeps its authentic identity; the persona guides the strategy.
+  console.log('Message strategy computed', {
+    prospectRole: profile.roleCategory,
+    targetPersona: strategy.targetPersona,
+    personaShifted: strategy.targetPersona !== profile.roleCategory,
+    capabilityTags: strategy.capabilityTags,
+    activeWorkflows: strategy.activeWorkflows,
+    alignmentScore: strategy.alignmentScore,
+    alignmentNote: strategy.alignmentNote,
+  });
+
+  if (strategy.alignmentScore < 0.25) {
+    console.warn('Low contextual alignment between prospect role and company_context', {
+      prospectRole: profile.roleCategory,
+      targetPersona: strategy.targetPersona,
+      alignmentScore: strategy.alignmentScore,
+    });
+  }
 
   // Translate TOV to description
   const tovDescription = translateTovToDescription(
@@ -74,32 +105,35 @@ export async function generateSequenceService(
     tov_config.directness
   );
 
-  // Generate sequence with AI
+  // Generate sequence with AI — receives profile, context, and strategy.
   const aiResult = await generateSequenceWithAI(
-    profileData,
+    profile,
     company_context,
     tovDescription,
-    sequence_length
+    sequence_length,
+    strategy
   );
 
   // Store everything in database using transaction for atomicity
-  const result = await prisma.$transaction(async (tx) => {
+  // Increased timeout to 15s to handle multiple sequential DB operations
+  const result = await prisma.$transaction(
+    async (tx) => {
     // Upsert prospect
     const prospect = await tx.prospect.upsert({
       where: { linkedinUrl: prospect_url },
       update: {
-        fullName: profileData.fullName,
-        headline: profileData.headline,
-        company: profileData.company,
-        profileData: profileData.profileData,
+        fullName: profile.fullName,
+        headline: profile.headline,
+        company: profile.company,
+        profileData: profile.profileData,
         updatedAt: new Date(),
       },
       create: {
         linkedinUrl: prospect_url,
-        fullName: profileData.fullName,
-        headline: profileData.headline,
-        company: profileData.company,
-        profileData: profileData.profileData,
+        fullName: profile.fullName,
+        headline: profile.headline,
+        company: profile.company,
+        profileData: profile.profileData,
       },
     });
 
@@ -150,12 +184,25 @@ export async function generateSequenceService(
         totalTokens: aiResult.tokenUsage.totalTokens,
         estimatedCost: aiResult.tokenUsage.estimatedCost,
         rawResponse: aiResult.rawResponse,
-        thinking: aiResult.analysis,
+        thinking: {
+          analysis: aiResult.analysis,
+          strategy: {
+            prospectRole: profile.roleCategory,
+            targetPersona: strategy.targetPersona,
+            capabilityTags: strategy.capabilityTags,
+            activeWorkflows: strategy.activeWorkflows,
+            alignmentScore: strategy.alignmentScore,
+          },
+        },
       },
     });
 
     return sequence;
-  });
+    },
+    {
+      timeout: 15000, // 15 seconds - enough for multiple sequential DB operations
+    }
+  );
 
   return {
     analysis: result.analysis as Record<string, any>,
@@ -200,18 +247,53 @@ async function findExistingSequence(
     return null;
   }
 
-  // Find matching sequence
+  // Find matching sequence generated with the current prompt version.
   const sequence = await prisma.messageSequence.findFirst({
     where: {
       prospectId: prospect.id,
       tovConfigId: tov.id,
       companyContext: companyContext,
       sequenceLength,
+      aiGenerations: {
+        some: {
+          promptVersion: PROMPT_VERSION,
+        },
+      },
     },
     orderBy: {
       createdAt: 'desc', // Return most recent if multiple exist
     },
   });
+
+  if (!sequence) {
+    const staleSequence = await prisma.messageSequence.findFirst({
+      where: {
+        prospectId: prospect.id,
+        tovConfigId: tov.id,
+        companyContext: companyContext,
+        sequenceLength,
+      },
+      orderBy: {
+        createdAt: 'desc',
+      },
+      include: {
+        aiGenerations: {
+          orderBy: {
+            createdAt: 'desc',
+          },
+          take: 1,
+        },
+      },
+    });
+
+    if (staleSequence) {
+      console.log('Skipping cached sequence due to prompt version mismatch; regenerating.', {
+        sequenceId: staleSequence.id,
+        expectedPromptVersion: PROMPT_VERSION,
+        cachedPromptVersion: staleSequence.aiGenerations[0]?.promptVersion || null,
+      });
+    }
+  }
 
   return sequence;
 }

@@ -1,43 +1,34 @@
 import OpenAI from 'openai';
 import { AppError } from '../utils/errorHandler';
+import type { ProspectProfile } from '../utils/linkedinParser';
+import { strategyToPromptBlock } from '../utils/roleContextStrategy';
+import type { MessageStrategy } from '../utils/roleContextStrategy';
 
 const apiKey = process.env.OPENAI_API_KEY;
 
 if (!apiKey) {
-  // Defensive check: do not crash the server, but log loudly.
   console.error(
     'OPENAI_API_KEY environment variable is missing. AI generation requests will fail until it is set.'
   );
 }
 
-const openai = apiKey
-  ? new OpenAI({
-      apiKey,
-    })
-  : null;
+const openai = apiKey ? new OpenAI({ apiKey }) : null;
 
-const PROMPT_VERSION = 'v1.2';
-
-// Model selection: Using gpt-4o-mini for cost-effective prototyping
-// In production, this could be configurable or A/B tested
+const PROMPT_VERSION = 'v5.2';
 const MODEL = 'gpt-4o-mini';
-const ANALYSIS_MODEL = MODEL;
-const REPAIR_MODEL = MODEL;
-const MAIN_TEMPERATURE = 0.5;
-const ANALYSIS_TEMPERATURE = 0.4;
-const REPAIR_TEMPERATURE = 0.2;
+const TEMPERATURE = 0.5;
 
-// Cost per 1M tokens (as of 2024)
-const PROMPT_COST_PER_1M = 0.15; // $0.15 per 1M input tokens
-const COMPLETION_COST_PER_1M = 0.6; // $0.60 per 1M output tokens
+// Cost per 1M tokens (gpt-4o-mini pricing)
+const PROMPT_COST_PER_1M = 0.15;
+const COMPLETION_COST_PER_1M = 0.6;
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
 
 export interface AIGenerationResult {
   analysis: Record<string, any>;
-  messages: Array<{
-    step: number;
-    message: string;
-    reasoning: string;
-  }>;
+  messages: Array<{ step: number; message: string; reasoning: string }>;
   confidence: number;
   tokenUsage: {
     promptTokens: number;
@@ -48,12 +39,7 @@ export interface AIGenerationResult {
   rawResponse: any;
 }
 
-interface ProspectData {
-  fullName: string;
-  headline: string;
-  company: string;
-  profileData: any;
-}
+type ProspectData = ProspectProfile;
 
 interface TokenUsage {
   promptTokens: number;
@@ -62,94 +48,55 @@ interface TokenUsage {
   estimatedCost: number;
 }
 
-interface AIJsonCallResult {
-  parsed: any;
-  rawResponse: any;
-  tokenUsage: TokenUsage;
-}
+// ---------------------------------------------------------------------------
+// Post-generation validation constants (light guardrails in code)
+// ---------------------------------------------------------------------------
 
-interface AnalysisPlan {
-  analysis: Record<string, any>;
-  angles: string[];
-  stepObjectives: string[];
-}
+// Only flag the truly egregious claims — outbound cannot touch these systems.
+const HARD_DOMAIN_CLAIMS = [
+  'improve ci/cd', 'improve deployment', 'improve backend performance',
+  'improve threat modeling', 'improve security controls',
+  'enhance infrastructure', 'boost reliability',
+];
 
-interface GenerationPassResult {
-  parsedResponse: any;
-  rawResponses: any[];
-  tokenUsages: TokenUsage[];
-  analysisPlan?: AnalysisPlan;
-}
-
-const STOPWORDS = new Set([
-  'and',
-  'the',
-  'for',
-  'with',
-  'that',
-  'this',
-  'from',
-  'into',
-  'your',
-  'their',
-  'about',
-  'over',
-  'under',
-  'build',
-  'building',
-  'senior',
-  'lead',
-  'manager',
-  'engineer',
-  'team',
-  'role',
-]);
+// Discourage generic marketing-speak — logged, not blocked.
+const GENERIC_FILLER_PHRASES = [
+  'would you be open to a brief chat', 'would love to connect',
+  'let me know if you\'d be interested', 'can we schedule a call',
+  'happy to chat', 'i\'ve been following', 'i came across your profile',
+  'innovative approach', 'i imagine', 'i can see how',
+  'cross-team collaboration', 'this could help',
+];
 
 const ANALYSIS_GENERIC_PHRASES = [
-  'industry-leading',
-  'unlock new opportunities',
-  'drive growth',
+  'industry-leading', 'unlock new opportunities', 'drive growth',
   'transform your business',
 ];
 
-const OPERATIONAL_IMPROVEMENT_KEYWORDS = [
-  'cycle time',
-  'lead time',
-  'conversion',
-  'response time',
-  'forecast',
-  'handoff',
-  'pipeline',
-  'incident',
-  'throughput',
-  'uptime',
-  'onboarding',
-  'latency',
-  'backlog',
-  'error rate',
-  'deployment',
+const CROSS_FUNCTIONAL_WORKFLOW_HINTS = [
+  'sales-engineering handoff', 'technical validation loop',
+  'prospect qualification feedback cycle', 'founder interrupt-driven engineering',
+  'inbound triage burden', 'pre-sales technical review',
+  'outbound personalization research load', 'qualification loop',
+  'inbound triage', 'technical validation step', 'cross-functional escalation loop',
 ];
 
-const SPECIFICITY_HINT_KEYWORDS = [
-  'pipeline',
-  'handoff',
-  'onboarding',
-  'incident',
-  'deployment',
-  'forecast',
-  'conversion',
-  'response',
-  'latency',
-  'backlog',
-];
+const STOPWORDS = new Set([
+  'and', 'the', 'for', 'with', 'that', 'this', 'from', 'into', 'your',
+  'their', 'about', 'over', 'under', 'build', 'building', 'senior',
+  'lead', 'manager', 'engineer', 'team', 'role',
+]);
 
-const MAX_QUALITY_REPAIR_ATTEMPTS = 1;
+// ---------------------------------------------------------------------------
+// Main entry point — ONE model call
+// ---------------------------------------------------------------------------
 
 export async function generateSequenceWithAI(
   prospectData: ProspectData,
   companyContext: string,
   tovDescription: string,
-  sequenceLength: number
+  sequenceLength: number,
+  strategy: MessageStrategy
 ): Promise<AIGenerationResult> {
   if (!openai) {
     console.error('AI generation attempted without a configured OpenAI client (missing OPENAI_API_KEY).');
@@ -157,98 +104,68 @@ export async function generateSequenceWithAI(
   }
 
   try {
-    const factsBlock = buildFactsBlock(prospectData);
-    let generationResult: GenerationPassResult;
+  const systemPrompt = buildSystemPrompt(sequenceLength);
+  const userPrompt = buildUserPrompt(prospectData, companyContext, tovDescription, sequenceLength, strategy);
 
-    try {
-      generationResult = await generateWithMultiPass(
-        prospectData,
-        companyContext,
-        tovDescription,
-        sequenceLength,
-        factsBlock
-      );
-    } catch (multiPassError) {
-      console.warn('Multi-pass generation failed; falling back to single-pass generation.', {
-        error: multiPassError instanceof Error ? multiPassError.message : multiPassError,
-      });
-      generationResult = await generateWithSinglePass(
-        prospectData,
-        companyContext,
-        tovDescription,
-        sequenceLength,
-        factsBlock
-      );
+    // Token observability — pre-call
+    console.log('Prompt lengths (chars)', {
+      systemPrompt: systemPrompt.length,
+      userPrompt: userPrompt.length,
+    });
+
+    const response = await openai.chat.completions.create({
+      model: MODEL,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+      response_format: { type: 'json_object' },
+      temperature: TEMPERATURE,
+    });
+
+    const content = response.choices[0]?.message?.content;
+    if (!content) {
+      console.error('Empty response from OpenAI API', { responseId: response.id });
+      throw new AppError('AI generation failed', 500, 'AI_GENERATION_FAILED');
     }
 
-    let parsedResponse = generationResult.parsedResponse;
-    validateGeneratedResponseStructure(parsedResponse, sequenceLength);
+    const tokenUsage = extractTokenUsage(response);
 
-    let qualityIssues = getQualityIssues(
-      parsedResponse,
-      prospectData,
-      companyContext
-    );
-
-    let repairAttempts = 0;
-    while (qualityIssues.length > 0 && repairAttempts < MAX_QUALITY_REPAIR_ATTEMPTS) {
-      repairAttempts += 1;
-      console.warn('Generated output failed quality checks; attempting repair pass.', {
-        qualityIssues,
-        attempt: repairAttempts,
-      });
-
-      const repaired = await runRepairPass(
-        parsedResponse,
-        qualityIssues,
-        prospectData,
-        companyContext,
-        tovDescription,
-        sequenceLength,
-        factsBlock,
-        generationResult.analysisPlan
-      );
-
-      generationResult.rawResponses.push(repaired.rawResponse);
-      generationResult.tokenUsages.push(repaired.tokenUsage);
-      parsedResponse = repaired.parsed;
-      validateGeneratedResponseStructure(parsedResponse, sequenceLength);
-      qualityIssues = getQualityIssues(parsedResponse, prospectData, companyContext);
-    }
-
-    if (qualityIssues.length > 0) {
-      console.warn('Proceeding with response despite unresolved quality warnings.', {
-        qualityIssues,
-      });
-    }
-
-    const totalUsage = mergeTokenUsages(generationResult.tokenUsages);
-
-    // Log token usage for observability and cost tracking
+    // Token observability — post-call
     console.log('AI generation token usage', {
       model: MODEL,
       promptVersion: PROMPT_VERSION,
-      promptTokens: totalUsage.promptTokens,
-      completionTokens: totalUsage.completionTokens,
-      totalTokens: totalUsage.totalTokens,
-      estimatedCost: totalUsage.estimatedCost,
-      stages: generationResult.rawResponses.length,
+      promptTokens: tokenUsage.promptTokens,
+      completionTokens: tokenUsage.completionTokens,
+      totalTokens: tokenUsage.totalTokens,
+      estimatedCost: tokenUsage.estimatedCost,
     });
 
+    const parsed = parseAIJsonContent(content);
+
+    // Structural validation (throws on failure)
+    validateOutputStructure(parsed, sequenceLength);
+
+    // Content validation — log issues but accept output (no repair pass).
+    // A senior engineer optimizes cost and complexity, not perfection.
+    const issues = validateContentQuality(parsed, prospectData, companyContext);
+    if (issues.length > 0) {
+      console.warn('Quality issues detected (accepted, no repair)', { issues });
+    }
+
+    // In-code sanitization for persistent banned phrases
+    sanitizeOutput(parsed);
+
+    const calcConf = calculateConfidence(parsed, prospectData);
+    const aiConf = parsed.confidence || 0.5;
+    const confidence = Math.abs(aiConf - calcConf) > 0.3 ? calcConf : (aiConf + calcConf) / 2;
+
     return {
-      analysis: parsedResponse.analysis || {},
-      messages: parsedResponse.messages,
-      confidence: parsedResponse.confidence,
-      tokenUsage: {
-        promptTokens: totalUsage.promptTokens,
-        completionTokens: totalUsage.completionTokens,
-        totalTokens: totalUsage.totalTokens,
-        estimatedCost: totalUsage.estimatedCost,
-      },
-      rawResponse:
-        generationResult.rawResponses.length === 1
-          ? generationResult.rawResponses[0]
-          : { stages: generationResult.rawResponses },
+      analysis: parsed.analysis || {},
+      messages: parsed.messages,
+      confidence,
+      tokenUsage,
+      rawResponse: response,
     };
   } catch (error: any) {
     console.error('AI generation error', {
@@ -256,179 +173,414 @@ export async function generateSequenceWithAI(
       stack: process.env.NODE_ENV === 'development' && error instanceof Error ? error.stack : undefined,
     });
 
-    if (error instanceof AppError) {
-      throw error;
-    }
+    if (error instanceof AppError) throw error;
 
-    // Handle OpenAI API errors
     if (error instanceof OpenAI.APIError) {
       console.error('OpenAI API error details', {
         status: error.status,
         code: error.code,
         type: error.type,
       });
-      throw new AppError('AI generation failed', 500, 'AI_GENERATION_FAILED');
     }
 
     throw new AppError('AI generation failed', 500, 'AI_GENERATION_FAILED');
   }
 }
 
-async function generateWithMultiPass(
+// ---------------------------------------------------------------------------
+// Adaptive step progression — narrative layers scale with sequence length
+// ---------------------------------------------------------------------------
+
+const LAYER_OBSERVATION = `OBSERVATION. "Hi [Name]," + a grounded hypothesis about their role and the chosen friction (<60 words). Reference a skill or headline detail. Statement, not a question. Example: "Hi Neo, most DevOps leads I talk to end up fielding late-stage security review requests for prospects that were never qualified — especially painful when the team's deep in Kubernetes work."`;
+
+const LAYER_SPOTLIGHT = `WORKFLOW SPOTLIGHT. No greeting. Name a specific capability or workflow FROM THE COMPANY CONTEXT and connect it to the friction. You MUST reference what the company sells (from company_context), not just restate the friction from Step 1. Be concrete about what happens and who triggers it. Can end with one question. Example: "The pattern I keep hearing is that security reviews get triggered before anyone confirms the prospect has real budget or timeline — so your team does the work, and the deal stalls anyway."`;
+
+const LAYER_CAUSE = `CAUSAL LINK. No greeting. Explain HOW the upstream problem (poor qualification, noisy pipeline) creates the friction for their team. Connect company_context to their pain. Example: "It usually starts upstream — qualification isn't precise enough, so technical validation gets triggered for prospects that should have been filtered two steps earlier."`;
+
+const LAYER_IMPROVEMENT = `IMPROVEMENT + CTA. No greeting. Name the concrete operational change and what's different after. End with a specific, low-friction ask. Example: "We help sales teams tighten that qualification layer so security reviews only happen when deal intent is confirmed. Happy to show what that filter looks like if the pattern sounds familiar."`;
+
+const LAYER_SOCIAL_PROOF = `SOCIAL PROOF. No greeting. Reference how similar teams solved this + reinforce the improvement. Example: "One platform team we work with cut their ad-hoc prospect-driven review load by routing all technical asks through a qualification gate first — only confirmed-intent prospects reach their queue now."`;
+
+const LAYER_EXPANSION = `EXPANSION. No greeting. Broaden the impact — name a second workflow or team that benefits from the same upstream fix. End with a specific ask. Example: "The same qualification filter also means your security team stops fielding questionnaires for deals that were never going to close — so the fix compounds across teams."`;
+
+function buildStepProgression(sequenceLength: number): string {
+  const steps: string[] = [];
+
+  if (sequenceLength === 1) {
+    steps.push(`1: OBSERVATION + CTA. "Hi [Name]," + grounded hypothesis about the friction + how we help + low-friction ask. All in one concise message (<80 words).`);
+  } else if (sequenceLength === 2) {
+    steps.push(`1: ${LAYER_OBSERVATION}`);
+    steps.push(`2: ${LAYER_IMPROVEMENT}`);
+  } else if (sequenceLength === 3) {
+    steps.push(`1: ${LAYER_OBSERVATION}`);
+    steps.push(`2: ${LAYER_SPOTLIGHT}`);
+    steps.push(`3: ${LAYER_IMPROVEMENT}`);
+  } else if (sequenceLength === 4) {
+    steps.push(`1: ${LAYER_OBSERVATION}`);
+    steps.push(`2: ${LAYER_SPOTLIGHT}`);
+    steps.push(`3: ${LAYER_CAUSE}`);
+    steps.push(`4: ${LAYER_IMPROVEMENT}`);
+  } else {
+    // 5+
+    steps.push(`1: ${LAYER_OBSERVATION}`);
+    steps.push(`2: ${LAYER_SPOTLIGHT}`);
+    steps.push(`3: ${LAYER_CAUSE}`);
+    steps.push(`4: ${LAYER_IMPROVEMENT}`);
+    steps.push(`5: ${LAYER_SOCIAL_PROOF}`);
+    if (sequenceLength >= 6) {
+      steps.push(`6: ${LAYER_EXPANSION}`);
+    }
+    for (let i = 7; i <= sequenceLength; i++) {
+      steps.push(`${i}: Follow-up. No greeting. Add a new angle or reinforce the improvement with a specific ask.`);
+    }
+  }
+
+  return `STEP PROGRESSION (each step is a DIFFERENT LAYER — not a different friction):\n${steps.join('\n')}`;
+}
+
+// ---------------------------------------------------------------------------
+// ONE system prompt (~400-500 tokens)
+// ---------------------------------------------------------------------------
+
+function buildSystemPrompt(sequenceLength: number): string {
+  return `You write LinkedIn DMs for B2B outbound automation. Output ONLY valid JSON.
+
+{
+  "analysis": {
+    "prospect_insights": "Max 3 sentences. Reference one skill + one inferred responsibility.",
+    "personalization_hooks": ["hook referencing actual data", "hook referencing actual data"],
+    "value_proposition": "How our product reduces cross-functional friction for the prospect's team."
+  },
+  "messages": [{ "step": 1, "message": "DM text", "reasoning": "Angle: <layer> | Workflow: <named> | Signal: <data point>" }],
+  "confidence": 0.85
+}
+
+Generate exactly ${sequenceLength} messages. Pick ONE friction from the user prompt. Build ALL messages as a progressive ${sequenceLength}-layer narrative — not ${sequenceLength} restatements.
+
+SCOPE:
+- Sales roles: frame as direct workflow improvement (targeting, enrichment, personalization, pipeline velocity).
+- Non-sales roles: frame as UPSTREAM FRICTION REDUCTION from their perspective. Not "we help sales qualify" — instead describe what changes FOR THEM: fewer interruptions, less validation noise, better filtering before escalation, reduced internal back-and-forth. Example: instead of "We help sales qualify prospects earlier" → "We reduce how often security gets pulled into late-stage reviews for deals that were never a fit."
+
+RULES:
+- LinkedIn DMs only. No subject lines, signatures, placeholders.
+- Step 1: "Hi [Name]," + observation (<60 words). Steps 2+: no re-greeting.
+- Each step = new narrative layer. Spotlight step must reference company_context.
+- No invented stats. No numeric claims. Hooks must reference real prospect data.
+- BANNED: "Would you be open to a brief chat", "Would love to connect", "I imagine", "I came across your profile", "I've been following", "operational workflows", "save your team time", "innovative approach".
+- Reasoning: max 25 words. Angle = layer name, not friction name.
+
+${buildStepProgression(sequenceLength)}
+
+Confidence: 0.8-0.95 (clear signals), 0.6-0.79 (ambiguous), 0.4-0.59 (weak).`;
+}
+
+// ---------------------------------------------------------------------------
+// Role-specific impact framing (eliminates generic "reduce sales interruptions")
+// ---------------------------------------------------------------------------
+
+// ROLE_IMPACT_MAP has been replaced by the strategy engine (roleContextStrategy.ts).
+// Role → friction mapping is now computed via:
+//   company_context → capability tags → role allowed workflows → intersection.
+// This eliminates static role framing and ensures causal validity per request.
+
+// ---------------------------------------------------------------------------
+// ONE user prompt
+// ---------------------------------------------------------------------------
+
+function buildUserPrompt(
   prospectData: ProspectData,
   companyContext: string,
   tovDescription: string,
   sequenceLength: number,
-  factsBlock: string
-): Promise<GenerationPassResult> {
-  const analysisCall = await requestJsonObjectFromAI({
-    model: ANALYSIS_MODEL,
-    systemPrompt: buildAnalysisSystemPrompt(),
-    userPrompt: buildAnalysisUserPrompt(
-      prospectData,
-      companyContext,
-      tovDescription,
-      sequenceLength,
-      factsBlock
-    ),
-    temperature: ANALYSIS_TEMPERATURE,
-  });
+  strategy: MessageStrategy
+): string {
+  const skills = prospectData.skills.length > 0 ? prospectData.skills.join(', ') : 'n/a';
+  const responsibilities = prospectData.inferredResponsibilities.length > 0
+    ? prospectData.inferredResponsibilities.join(', ')
+    : 'n/a';
 
-  const analysisPlan = parseAnalysisPlan(analysisCall.parsed, sequenceLength);
-  const finalCall = await requestJsonObjectFromAI({
-    model: MODEL,
-    systemPrompt: buildSystemPrompt(sequenceLength),
-    userPrompt: buildUserPrompt(
-      prospectData,
-      companyContext,
-      tovDescription,
-      sequenceLength,
-      factsBlock,
-      analysisPlan
-    ),
-    temperature: MAIN_TEMPERATURE,
-  });
+  const experience = Array.isArray(prospectData.profileData?.experience)
+    ? prospectData.profileData.experience
+        .map((e) => `${e.title} at ${e.company} (${e.duration})`)
+        .join(' | ')
+    : 'n/a';
 
-  return {
-    parsedResponse: finalCall.parsed,
-    rawResponses: [analysisCall.rawResponse, finalCall.rawResponse],
-    tokenUsages: [analysisCall.tokenUsage, finalCall.tokenUsage],
-    analysisPlan,
-  };
+  // Strategy-driven friction block replaces static ROLE_IMPACT_MAP
+  const frictionBlock = strategyToPromptBlock(strategy);
+
+  // If strategy targets a different persona than the enriched profile, add persona signal.
+  // The profile stays authentic — we don't fake their identity. The strategy tells
+  // the model which frictions to surface and how to frame the value.
+  const personaSignal = strategy.targetPersona !== prospectData.roleCategory
+    ? `\nTARGET PERSONA: ${strategy.targetPersona}. The prospect's profile is ${prospectData.roleCategory}, but the company_context is most relevant to ${strategy.targetPersona} frictions. Frame the outreach through ${strategy.targetPersona}-relevant pain points while personalizing with the prospect's actual skills and experience.`
+    : '';
+
+  return `Generate ${sequenceLength} LinkedIn DMs for this prospect.
+
+PROSPECT:
+- Name: ${prospectData.fullName}
+- Headline: ${prospectData.headline}
+- Company: ${prospectData.company}
+- Role: ${prospectData.roleCategory} (${prospectData.seniority})
+- Skills: ${skills}
+- Responsibilities: ${responsibilities}
+- Experience: ${experience}${personaSignal}
+
+COMPANY CONTEXT (what we sell): ${companyContext}
+
+TONE: ${tovDescription}
+
+${frictionBlock}
+
+GROUNDING:
+- prospect_insights: reference one skill + one headline responsibility. Max 3 sentences.
+- personalization_hooks: exactly 2. Must reference actual data (skill name, company, headline keyword).
+- value_proposition: how our product reduces the chosen friction. Reference company capability + prospect role.
+- Pick ONE friction. Build ${sequenceLength} progressive layers. Last message = company_context + CTA.
+
+Return ONLY JSON.`;
 }
 
-async function generateWithSinglePass(
+// ---------------------------------------------------------------------------
+// Structural validation (throws on failure)
+// ---------------------------------------------------------------------------
+
+function validateOutputStructure(parsed: any, sequenceLength: number): void {
+  if (!parsed || typeof parsed !== 'object') {
+    throw new AppError('AI generation failed', 500, 'AI_GENERATION_FAILED');
+  }
+
+  if (!parsed.analysis || typeof parsed.analysis !== 'object') {
+    throw new AppError('AI generation failed: missing analysis', 500, 'AI_GENERATION_FAILED');
+  }
+
+  if (!Array.isArray(parsed.messages)) {
+    throw new AppError('AI generation failed: missing messages', 500, 'AI_GENERATION_FAILED');
+  }
+
+  if (typeof parsed.confidence !== 'number') {
+    throw new AppError('AI generation failed: missing confidence', 500, 'AI_GENERATION_FAILED');
+  }
+
+  if (parsed.messages.length !== sequenceLength) {
+    throw new AppError('AI generation failed: message count mismatch', 500, 'AI_GENERATION_FAILED');
+  }
+
+  for (const [index, msg] of parsed.messages.entries()) {
+    if (!msg || typeof msg !== 'object') {
+      throw new AppError(`AI generation failed: message ${index + 1} invalid`, 500, 'AI_GENERATION_FAILED');
+    }
+    // Normalize step to expected sequential value (models sometimes misnumber)
+    msg.step = index + 1;
+    if (typeof msg.message !== 'string' || !msg.message.trim()) {
+      throw new AppError(`AI generation failed: message ${index + 1} empty`, 500, 'AI_GENERATION_FAILED');
+    }
+    if (typeof msg.reasoning !== 'string' || !msg.reasoning.trim()) {
+      throw new AppError(`AI generation failed: reasoning ${index + 1} empty`, 500, 'AI_GENERATION_FAILED');
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Content quality validation (code-level guardrails)
+// ---------------------------------------------------------------------------
+
+function validateContentQuality(
+  parsed: Record<string, any>,
   prospectData: ProspectData,
-  companyContext: string,
-  tovDescription: string,
-  sequenceLength: number,
-  factsBlock: string
-): Promise<GenerationPassResult> {
-  const finalCall = await requestJsonObjectFromAI({
-    model: MODEL,
-    systemPrompt: buildSystemPrompt(sequenceLength),
-    userPrompt: buildUserPrompt(
-      prospectData,
-      companyContext,
-      tovDescription,
-      sequenceLength,
-      factsBlock
-    ),
-    temperature: MAIN_TEMPERATURE,
-  });
+  _companyContext: string
+): string[] {
+  const issues: string[] = [];
+  const analysis = (parsed.analysis || {}) as Record<string, any>;
+  const insights = str(analysis.prospect_insights);
+  const valueProp = str(analysis.value_proposition);
+  const skills = prospectData.skills.map((s) => s.toLowerCase());
+  const headlineKw = extractSignalKeywords(prospectData.headline);
 
-  return {
-    parsedResponse: finalCall.parsed,
-    rawResponses: [finalCall.rawResponse],
-    tokenUsages: [finalCall.tokenUsage],
-  };
-}
-
-async function runRepairPass(
-  currentResponse: Record<string, any>,
-  qualityIssues: string[],
-  prospectData: ProspectData,
-  companyContext: string,
-  tovDescription: string,
-  sequenceLength: number,
-  factsBlock: string,
-  analysisPlan?: AnalysisPlan
-): Promise<AIJsonCallResult> {
-  return requestJsonObjectFromAI({
-    model: REPAIR_MODEL,
-    systemPrompt: buildRepairSystemPrompt(sequenceLength),
-    userPrompt: buildRepairUserPrompt(
-      currentResponse,
-      qualityIssues,
-      prospectData,
-      companyContext,
-      tovDescription,
-      sequenceLength,
-      factsBlock,
-      analysisPlan
-    ),
-    temperature: REPAIR_TEMPERATURE,
-  });
-}
-
-function parseAnalysisPlan(parsed: any, sequenceLength: number): AnalysisPlan {
-  if (!parsed || typeof parsed !== 'object' || !parsed.analysis || typeof parsed.analysis !== 'object') {
-    console.error('Invalid analysis plan structure.', { parsedKeys: Object.keys(parsed || {}) });
-    throw new AppError('AI generation failed', 500, 'AI_GENERATION_FAILED');
+  // --- No invented statistics ---
+  if (/\d+%/.test(insights) || /\d+%/.test(valueProp)) {
+    issues.push('analysis contains numeric percentage claims');
   }
 
-  const rawAngles: unknown[] = Array.isArray(parsed.angles) ? parsed.angles : [];
-  const rawStepObjectives: unknown[] = Array.isArray(parsed.step_objectives)
-    ? parsed.step_objectives
-    : [];
-
-  const angles = rawAngles
-    .filter((item: unknown): item is string => typeof item === 'string' && item.trim().length > 0)
-    .slice(0, Math.max(2, sequenceLength));
-
-  const stepObjectives = rawStepObjectives
-    .filter((item: unknown): item is string => typeof item === 'string' && item.trim().length > 0)
-    .slice(0, sequenceLength);
-
-  return {
-    analysis: parsed.analysis as Record<string, any>,
-    angles,
-    stepObjectives,
-  };
-}
-
-async function requestJsonObjectFromAI(options: {
-  model: string;
-  systemPrompt: string;
-  userPrompt: string;
-  temperature: number;
-}): Promise<AIJsonCallResult> {
-  if (!openai) {
-    throw new AppError('AI generation failed', 500, 'AI_GENERATION_FAILED');
+  // --- prospect_insights grounding ---
+  if (skills.length > 0 && !hits(insights, skills)) {
+    issues.push('prospect_insights should reference at least one skill');
+  }
+  if (hits(insights, ANALYSIS_GENERIC_PHRASES)) {
+    issues.push('prospect_insights contains generic phrasing');
   }
 
-  const response = await openai.chat.completions.create({
-    model: options.model,
-    messages: [
-      { role: 'system', content: options.systemPrompt },
-      { role: 'user', content: options.userPrompt },
-    ],
-    response_format: { type: 'json_object' },
-    temperature: options.temperature,
-  });
-
-  const content = response.choices[0]?.message?.content;
-  if (!content) {
-    console.error('Empty response from OpenAI API', { responseId: response.id });
-    throw new AppError('AI generation failed', 500, 'AI_GENERATION_FAILED');
+  // --- personalization_hooks: must be exactly 2 ---
+  const hooks = Array.isArray(analysis.personalization_hooks) ? analysis.personalization_hooks : [];
+  if (hooks.length !== 2) {
+    issues.push(`personalization_hooks must be exactly 2 (found ${hooks.length})`);
   }
 
-  return {
-    parsed: parseAIJsonContent(content),
-    rawResponse: response,
-    tokenUsage: extractTokenUsage(response),
-  };
+  // --- Hard domain claims only (not micro-policing) ---
+  if (!isSales(prospectData.roleCategory) && hits(valueProp, HARD_DOMAIN_CLAIMS)) {
+    issues.push('value_proposition claims improvement to core technical system');
+  }
+
+  // --- messages ---
+  for (const [i, msg] of parsed.messages.entries()) {
+    const text = str(msg.message);
+    const reasoning = String(msg.reasoning || '');
+    const reasoningLower = reasoning.toLowerCase();
+    const idx = i + 1;
+
+    // Step 1 length
+    if (i === 0) {
+      const wordCount = String(msg.message || '').trim().split(/\s+/).length;
+      if (wordCount > 60) {
+        issues.push(`message 1 exceeds 60 words (${wordCount})`);
+      }
+    }
+
+    // No invented stats
+    if (/\d+%/.test(text)) {
+      issues.push(`message ${idx} contains numeric percentage claim`);
+    }
+
+    // Generic filler
+    if (hits(text, GENERIC_FILLER_PHRASES)) {
+      issues.push(`message ${idx} contains generic filler`);
+    }
+
+    // Hard domain claims (non-sales only)
+    if (!isSales(prospectData.roleCategory) && hits(text, HARD_DOMAIN_CLAIMS)) {
+      issues.push(`message ${idx} claims improvement to core technical system`);
+    }
+
+    // Reasoning: check labels exist (lightly)
+    const angle = extractLabel(reasoningLower, 'angle');
+    const workflow = extractLabel(reasoningLower, 'workflow');
+    const signal = extractLabel(reasoningLower, 'signal');
+
+    if (!angle) issues.push(`message ${idx} reasoning missing Angle label`);
+    if (!workflow) issues.push(`message ${idx} reasoning missing Workflow label`);
+    // Signal: just check it mentions something concrete — no taxonomy enforcement
+    if (!signal || signal.length < 3) {
+      issues.push(`message ${idx} reasoning missing Signal (should mention a concrete profile element)`);
+    }
+  }
+
+  // --- narrative: all-question detection ---
+  if (parsed.messages.length >= 2) {
+    const questionCount = parsed.messages.filter(
+      (m: any) => String(m.message || '').trim().endsWith('?')
+    ).length;
+    if (questionCount === parsed.messages.length) {
+      issues.push('all messages end with questions — need progressive narrative layers');
+    }
+  }
+
+  // --- restatement detection ---
+  for (let i = 1; i < parsed.messages.length; i++) {
+    const prevWords = extractContentWords(str(parsed.messages[i - 1].message));
+    const currWords = extractContentWords(str(parsed.messages[i].message));
+    if (prevWords.size > 0 && currWords.size > 0) {
+      let overlap = 0;
+      for (const w of currWords) {
+        if (prevWords.has(w)) overlap++;
+      }
+      const ratio = overlap / Math.min(prevWords.size, currWords.size);
+      if (ratio > 0.5) {
+        issues.push(`messages ${i} and ${i + 1} are too similar (${Math.round(ratio * 100)}% overlap)`);
+      }
+    }
+  }
+
+  return issues;
 }
+
+// ---------------------------------------------------------------------------
+// In-code text sanitization (catches phrases that survive model passes)
+// ---------------------------------------------------------------------------
+
+const TEXT_REPLACEMENTS: [RegExp, string][] = [
+  [/\bstreamlining\s+/gi, 'reducing '],
+  [/\bstreamlines?\s+the\b/gi, 'reduces friction in'],
+  [/\bstreamlines?\s/gi, 'reduces '],
+  [/\bsmoother\s+operational\b/gi, 'fewer disruptive'],
+  [/\boperational\s+workflows?\b/gi, 'cross-functional processes'],
+  [/\boperational\s+readiness\b/gi, 'team focus'],
+  [/\boperational\s+efficiency\b/gi, 'qualification clarity'],
+  [/\bcan disrupt workflow significantly\b/gi, 'pulls your team off planned work'],
+  [/\bsave your team time\b/gi, 'free your team from unqualified noise'],
+  [/\bwaste valuable time\b/gi, 'cost your team cycles on deals that never close'],
+];
+
+function sanitizeText(text: string): string {
+  let result = text;
+  for (const [pattern, replacement] of TEXT_REPLACEMENTS) {
+    result = result.replace(pattern, replacement);
+  }
+  return result;
+}
+
+function sanitizeOutput(parsed: Record<string, any>): void {
+  if (parsed.analysis) {
+    if (typeof parsed.analysis.value_proposition === 'string') {
+      parsed.analysis.value_proposition = sanitizeText(parsed.analysis.value_proposition);
+    }
+    if (typeof parsed.analysis.prospect_insights === 'string') {
+      parsed.analysis.prospect_insights = sanitizeText(parsed.analysis.prospect_insights);
+    }
+  }
+  if (Array.isArray(parsed.messages)) {
+    for (const msg of parsed.messages) {
+      if (typeof msg.message === 'string') {
+        msg.message = sanitizeText(msg.message);
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Confidence calculation (grounding-based, not random)
+// ---------------------------------------------------------------------------
+
+function calculateConfidence(parsed: Record<string, any>, prospectData: ProspectData): number {
+  const analysis = (parsed.analysis || {}) as Record<string, any>;
+  const insights = str(analysis.prospect_insights);
+  const valueProp = str(analysis.value_proposition);
+  const skills = prospectData.skills.map((s) => s.toLowerCase());
+  const headlineKw = extractSignalKeywords(prospectData.headline);
+
+  let score = 0.5;
+
+  // Skills available and referenced
+  if (skills.length > 0) {
+    score += hits(insights, skills) ? 0.2 : -0.1;
+  } else {
+    score -= 0.1;
+  }
+
+  // Role inference
+  if (headlineKw.length > 0 && hits(insights, headlineKw)) {
+    score += 0.15;
+  } else {
+    score -= 0.1;
+  }
+
+  // Causal mapping
+  if (hasNamedWorkflow(valueProp) && headlineKw.length > 0 && hits(valueProp, headlineKw)) {
+    score += 0.15;
+  } else {
+    score -= 0.1;
+  }
+
+  // Generic penalty
+  if (hits(insights, ANALYSIS_GENERIC_PHRASES)) {
+    score -= 0.2;
+  }
+
+  return Math.max(0.4, Math.min(0.95, score));
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 function parseAIJsonContent(content: string): any {
   try {
@@ -436,21 +588,14 @@ function parseAIJsonContent(content: string): any {
   } catch {
     const jsonMatch =
       content.match(/```json\s*([\s\S]*?)\s*```/) || content.match(/```\s*([\s\S]*?)\s*```/);
-
     if (!jsonMatch) {
-      console.error('Failed to parse AI response as JSON (no JSON block found).', {
-        contentSnippet: content.slice(0, 300),
-      });
+      console.error('Failed to parse AI response as JSON.', { snippet: content.slice(0, 300) });
       throw new AppError('AI generation failed', 500, 'AI_GENERATION_FAILED');
     }
-
     try {
       return JSON.parse(jsonMatch[1]);
-    } catch (parseError) {
-      console.error('Failed to parse extracted JSON block.', {
-        contentSnippet: content.slice(0, 300),
-        error: parseError instanceof Error ? parseError.message : parseError,
-      });
+    } catch (e) {
+      console.error('Failed to parse extracted JSON block.', { snippet: content.slice(0, 300) });
       throw new AppError('AI generation failed', 500, 'AI_GENERATION_FAILED');
     }
   }
@@ -463,494 +608,63 @@ function extractTokenUsage(response: OpenAI.Chat.Completions.ChatCompletion): To
   const estimatedCost =
     (promptTokens / 1_000_000) * PROMPT_COST_PER_1M +
     (completionTokens / 1_000_000) * COMPLETION_COST_PER_1M;
-
-  return {
-    promptTokens,
-    completionTokens,
-    totalTokens,
-    estimatedCost,
-  };
+  return { promptTokens, completionTokens, totalTokens, estimatedCost };
 }
 
-function mergeTokenUsages(usages: TokenUsage[]): TokenUsage {
-  return usages.reduce(
-    (acc, usage) => ({
-      promptTokens: acc.promptTokens + usage.promptTokens,
-      completionTokens: acc.completionTokens + usage.completionTokens,
-      totalTokens: acc.totalTokens + usage.totalTokens,
-      estimatedCost: acc.estimatedCost + usage.estimatedCost,
-    }),
-    { promptTokens: 0, completionTokens: 0, totalTokens: 0, estimatedCost: 0 }
-  );
+
+/** Lowercase string helper */
+function str(val: unknown, lower = true): string {
+  const s = String(val || '');
+  return lower ? s.toLowerCase() : s;
 }
 
-function validateGeneratedResponseStructure(parsedResponse: any, sequenceLength: number): void {
-  if (!parsedResponse || typeof parsedResponse !== 'object') {
-    console.error('Invalid AI response structure: root must be an object.');
-    throw new AppError('AI generation failed', 500, 'AI_GENERATION_FAILED');
-  }
-
-  if (!parsedResponse.messages || !Array.isArray(parsedResponse.messages)) {
-    console.error('Invalid AI response structure: missing messages array.', {
-      parsedKeys: Object.keys(parsedResponse || {}),
-    });
-    throw new AppError('AI generation failed', 500, 'AI_GENERATION_FAILED');
-  }
-
-  if (!parsedResponse.analysis || typeof parsedResponse.analysis !== 'object') {
-    console.error('Invalid AI response structure: missing analysis object.', {
-      parsedKeys: Object.keys(parsedResponse || {}),
-    });
-    throw new AppError('AI generation failed', 500, 'AI_GENERATION_FAILED');
-  }
-
-  if (typeof parsedResponse.confidence !== 'number') {
-    console.error('Invalid AI response structure: missing confidence score.', {
-      confidenceType: typeof parsedResponse.confidence,
-    });
-    throw new AppError('AI generation failed', 500, 'AI_GENERATION_FAILED');
-  }
-
-  if (parsedResponse.messages.length !== sequenceLength) {
-    console.error('Invalid AI response structure: message count mismatch.', {
-      expected: sequenceLength,
-      actual: parsedResponse.messages.length,
-    });
-    throw new AppError('AI generation failed', 500, 'AI_GENERATION_FAILED');
-  }
-
-  for (const [index, messageItem] of parsedResponse.messages.entries()) {
-    if (!messageItem || typeof messageItem !== 'object') {
-      console.error('Invalid AI response structure: message is not an object.', { index });
-      throw new AppError('AI generation failed', 500, 'AI_GENERATION_FAILED');
-    }
-
-    const expectedStep = index + 1;
-    const step = (messageItem as { step?: unknown }).step;
-    const messageText = (messageItem as { message?: unknown }).message;
-    const reasoningText = (messageItem as { reasoning?: unknown }).reasoning;
-
-    if (!Number.isInteger(step) || step !== expectedStep) {
-      console.error('Invalid AI response structure: message.step must be sequential.', {
-        index,
-        expectedStep,
-        step,
-      });
-      throw new AppError('AI generation failed', 500, 'AI_GENERATION_FAILED');
-    }
-
-    if (typeof messageText !== 'string' || messageText.trim().length === 0) {
-      console.error('Invalid AI response structure: message.message must be a non-empty string.', {
-        index,
-        messageType: typeof messageText,
-      });
-      throw new AppError('AI generation failed', 500, 'AI_GENERATION_FAILED');
-    }
-
-    if (typeof reasoningText !== 'string' || reasoningText.trim().length === 0) {
-      console.error('Invalid AI response structure: message.reasoning must be a non-empty string.', {
-        index,
-        reasoningType: typeof reasoningText,
-      });
-      throw new AppError('AI generation failed', 500, 'AI_GENERATION_FAILED');
-    }
-  }
+/** Check if text contains any of the given tokens (case-insensitive) */
+function hits(text: string, tokens: string[]): boolean {
+  return tokens.some((t) => t && text.includes(t.toLowerCase()));
 }
 
-function getQualityIssues(
-  parsedResponse: Record<string, any>,
-  prospectData: ProspectData,
-  companyContext: string
-): string[] {
-  const issues: string[] = [];
-  const analysis = (parsedResponse.analysis || {}) as Record<string, any>;
-  const prospectInsights = String(analysis.prospect_insights || '').toLowerCase();
-  const valueProposition = String(analysis.value_proposition || '').toLowerCase();
-  const headlineKeywords = extractSignalKeywords(prospectData.headline);
-  const companyContextKeywords = extractSignalKeywords(companyContext);
-  const skills = Array.isArray(prospectData.profileData?.skills)
-    ? (prospectData.profileData.skills as unknown[])
-        .filter((item): item is string => typeof item === 'string')
-        .map((skill) => skill.toLowerCase())
-    : [];
-
-  if (skills.length > 0 && !containsAnyToken(prospectInsights, skills)) {
-    issues.push('analysis.prospect_insights should reference at least one explicit skill from profileData.skills');
-  }
-
-  if (headlineKeywords.length > 0 && !containsAnyToken(prospectInsights, headlineKeywords)) {
-    issues.push('analysis.prospect_insights should reference a responsibility signal inferred from headline');
-  }
-
-  if (containsAnyToken(prospectInsights, ANALYSIS_GENERIC_PHRASES)) {
-    issues.push('analysis.prospect_insights contains generic unsupported phrasing');
-  }
-
-  if (headlineKeywords.length > 0 && !containsAnyToken(valueProposition, headlineKeywords)) {
-    issues.push('analysis.value_proposition should include responsibility language tied to headline');
-  }
-
-  if (companyContextKeywords.length > 0 && !containsAnyToken(valueProposition, companyContextKeywords)) {
-    issues.push('analysis.value_proposition should include terms grounded in company_context');
-  }
-
-  if (!containsAnyToken(valueProposition, OPERATIONAL_IMPROVEMENT_KEYWORDS)) {
-    issues.push('analysis.value_proposition should include a concrete operational improvement');
-  }
-
-  if (
-    valueProposition.includes('streamline workflows') &&
-    !containsAnyToken(valueProposition, SPECIFICITY_HINT_KEYWORDS)
-  ) {
-    issues.push('analysis.value_proposition uses vague language without operational specifics');
-  }
-
-  return issues;
+/** Extract a label value from reasoning (e.g. "Angle: ..." ) */
+function extractLabel(reasoning: string, label: string): string {
+  const match = reasoning.match(new RegExp(`${label}\\s*:\\s*([^|.;\\n]+)`, 'i'));
+  return match ? match[1].trim().toLowerCase() : '';
 }
 
-function containsAnyToken(text: string, tokens: string[]): boolean {
-  return tokens.some((token) => token && text.includes(token.toLowerCase()));
+/** Check if text references a named outbound workflow */
+function hasNamedWorkflow(text: string): boolean {
+  const n = text.toLowerCase();
+  if (hits(n, CROSS_FUNCTIONAL_WORKFLOW_HINTS)) return true;
+  return /\b(handoff|triage|qualification|validation|pre-sales|interrupt|research load|review cycle)\b/.test(n);
+}
+
+/** Check if role is sales/revenue/BD — outbound automation IS their core workflow */
+function isSales(roleCategory: string): boolean {
+  const r = roleCategory.toLowerCase();
+  return r.includes('sales') || r.includes('revenue') || r.includes('business development');
 }
 
 function extractSignalKeywords(text: string): string[] {
   const tokens = text
     .toLowerCase()
     .split(/[^a-z0-9]+/)
-    .filter((token) => token.length >= 4 && !STOPWORDS.has(token));
-
+    .filter((t) => t.length >= 4 && !STOPWORDS.has(t));
   return Array.from(new Set(tokens)).slice(0, 12);
 }
 
-function buildFactsBlock(prospectData: ProspectData): string {
-  const skills = Array.isArray(prospectData.profileData?.skills)
-    ? (prospectData.profileData.skills as unknown[])
-        .filter((item): item is string => typeof item === 'string')
-        .join(', ')
-    : 'n/a';
-
-  const experience = Array.isArray(prospectData.profileData?.experience)
-    ? (prospectData.profileData.experience as Array<Record<string, unknown>>)
-        .map((entry) => {
-          const title = typeof entry.title === 'string' ? entry.title : 'Unknown title';
-          const company = typeof entry.company === 'string' ? entry.company : 'Unknown company';
-          const duration = typeof entry.duration === 'string' ? entry.duration : 'Unknown duration';
-          return `${title} at ${company} (${duration})`;
-        })
-        .join(' | ')
-    : 'n/a';
-
-  const summary =
-    typeof prospectData.profileData?.summary === 'string'
-      ? prospectData.profileData.summary
-      : 'n/a';
-
-  return `FACTS:
-- Name: ${prospectData.fullName}
-- Headline: ${prospectData.headline}
-- Current Company: ${prospectData.company}
-- Skills: ${skills}
-- Experience: ${experience}
-- Summary: ${summary}`;
-}
-
-function buildAnalysisSystemPrompt(): string {
-  return `You are a B2B SaaS prospect analyst. Output ONLY valid JSON.
-
-Return this exact structure:
-{
-  "analysis": {
-    "prospect_insights": "Grounded analysis of this prospect's likely responsibilities and operating context",
-    "personalization_hooks": ["specific hook 1", "specific hook 2"],
-    "value_proposition": "Concrete value proposition connected to role + company_context + operational improvement"
-  },
-  "angles": ["angle 1", "angle 2", "angle 3"],
-  "step_objectives": ["step 1 objective", "step 2 objective", "step 3 objective"]
-}
-
-MANDATORY GROUNDING:
-- Use only provided facts; do not invent unsupported claims.
-- In analysis.prospect_insights, reference at least one explicit skill when skills are provided.
-- In analysis.prospect_insights, reference one responsibility inferred from headline.
-- In analysis.value_proposition, explicitly connect:
-  1) prospect responsibility,
-  2) company_context capability,
-  3) concrete operational improvement.
-- Avoid vague phrases like "streamline workflows" unless you name a specific workflow/operational area.
-- Ensure output varies across prospects by using provided profile data (headline, company, skills, experience).
-
-ROLE-AWARE PLAYBOOKS:
-- Engineering roles: prioritize reliability, deployment velocity, incident reduction, system performance.
-- Product roles: prioritize prioritization quality, roadmap execution, cross-functional alignment, release outcomes.
-- Data roles: prioritize pipeline reliability, data quality, model/report freshness, stakeholder delivery.
-- DevOps/platform roles: prioritize infra stability, CI/CD throughput, change failure reduction, observability.
-- Security roles: prioritize risk reduction, controls coverage, incident response readiness, compliance evidence.
-- If role is mixed/unclear, stick to explicit facts and conservative inference.
-
-SILENT QUALITY CHECKLIST (DO NOT OUTPUT):
-- Skills referenced? Responsibility inferred from headline? Value prop linked to company_context and concrete operations?
-- No generic unsupported claims?
-- Output strictly valid JSON only.`;
-}
-
-function buildSystemPrompt(sequenceLength: number): string {
-  return `You are an expert at writing realistic, insight-driven LinkedIn direct messages between experienced B2B SaaS operators.
-
-CRITICAL REQUIREMENTS:
-1. Output ONLY valid JSON. No markdown, no code blocks, no commentary, no extra text before or after the JSON.
-2. Return a JSON object with this exact structure:
-{
-  "analysis": {
-    "prospect_insights": "Brief analysis of the prospect, how their role operates day-to-day, and what they are likely accountable for",
-    "personalization_hooks": ["specific observation or hook 1", "specific observation or hook 2"],
-    "value_proposition": "Why this prospect should care, tied tightly to their responsibilities and likely challenges"
-  },
-  "messages": [
-    {
-      "step": 1,
-      "message": "Full LinkedIn DM text",
-      "reasoning": "Why this message works for this prospect, which profile signals it uses, and which role-level challenges it is addressing"
-    }
-  ],
-  "confidence": 0.85
-}
-
-3. Generate exactly ${sequenceLength} messages in the messages array.
-4. Each message must include:
-   - step: sequential number (1, 2, 3...)
-   - message: a single LinkedIn direct message (no subject line)
-   - reasoning: explanation of why this message fits the prospect and how it uses their profile.
-
-5. Confidence must be a number between 0 and 1 representing your confidence in the sequence quality.
-
-LINKEDIN-NATIVE MESSAGING RULES:
-- Write as LinkedIn DMs, not emails.
-- NO subject lines.
-- NO email formatting (no "Subject:", no greetings like "Dear ...", no signature blocks).
-- NO signatures (no name, title, or company at the end).
-- NO placeholders or template variables like [Your Company Name], [First Name], or any text in brackets [like this].
-- NO brackets used as template markers. Do not output any [PLACEHOLDER] style text.
-
-ANTI-GENERIC / ANTI-MARKETING GUARDRAILS:
-- DO NOT use generic phrases such as:
-  - "Hope this message finds you well"
-  - "I came across your profile"
-  - "Following up on my previous email"
-  - "Would you be open to a brief chat"
-  - "Just checking in"
-- Avoid vague references like "some SaaS companies", "many businesses", or "organizations like yours".
-- Avoid generic business clichés and obvious sales framing (e.g., "drive growth", "unlock new opportunities", "transform your business").
-
-MESSAGE REALISM:
-- step 1 message MUST be under 60 words.
-- All messages must feel conversational and natural, as if written by a peer who deeply understands B2B SaaS, not a salesperson.
-- Avoid corporate buzzwords and jargon (e.g., "synergies", "leverage at scale", "cutting-edge solution").
-- Avoid over-polished marketing or pitch-deck tone. Prefer simple, specific, grounded language.
-
-PERSONALIZATION & INSIGHT:
-- Go beyond surface-level skills. Use the prospect's role, seniority, company type, and experience to infer what they are likely responsible for (metrics, workflows, decisions).
-- Infer 1–2 likely challenges or tradeoffs this role faces and weave them into the messages.
-- Tie the company context and value proposition directly to those responsibilities and challenges.
-- Each message should include at least one subtle, concrete observation about the prospect's situation, not just flattery.
-- Make each message feel written uniquely for this prospect, not a generic persona.
-
-ANALYSIS GROUNDING RULES:
-- In analysis.prospect_insights, explicitly reference at least one skill from profileData.skills when skills are provided.
-- In analysis.prospect_insights, explicitly reference one likely responsibility inferred from the headline.
-- Do not use generic claims unless directly supported by the provided profile data.
-- In analysis.value_proposition, explicitly connect: (a) the prospect's likely responsibilities, (b) the provided company context, and (c) one concrete operational improvement.
-- Avoid vague phrases like "streamline workflows" unless you name a specific workflow or operational area.
-- Ensure variation across prospects by grounding analysis in the actual provided profile data (headline, company, skills, experience), not reused template phrasing.
-
-ROLE-AWARE PLAYBOOKS:
-- Engineering roles: emphasize reliability, release quality, performance, and incident load.
-- Product roles: emphasize prioritization clarity, roadmap execution, and cross-functional throughput.
-- Data roles: emphasize data quality, pipeline reliability, freshness, and stakeholder trust.
-- DevOps/platform roles: emphasize CI/CD stability, infra reliability, and operational visibility.
-- Security roles: emphasize control coverage, risk reduction, and response readiness.
-
-STEP OBJECTIVES:
-- Step 1: concise opener (<60 words), one grounded observation, one role-specific hypothesis.
-- Step 2: spotlight a concrete operational friction tied to responsibility and context.
-- Step 3: propose a concrete improvement and low-friction next step.
-- Steps 4+: continue progression with new evidence-backed angles; avoid repetition.
-
-INSIGHT-DRIVEN SEQUENCE:
-- Treat this as thoughtful peer outreach: focus on observations, hypotheses, and value, not aggressive pitching.
-- Each message should add a new, specific insight or angle (e.g., a pattern you see in similar companies, a workflow friction they probably have, or a small suggestion).
-
-SEQUENCE COHERENCE:
-- Each message should build naturally on the previous messages.
-- Do not repeat the same pitch; evolve the conversation slightly with each step.
-
-STRICT OUTPUT:
-- DO NOT include markdown formatting.
-- DO NOT include any commentary, explanation, or notes outside the JSON structure.
-- DO NOT output raw chain-of-thought; keep reasoning concise and limited to the requested fields.
-
-SILENT QUALITY RUBRIC (DO NOT OUTPUT):
-- analysis.prospect_insights references at least one explicit skill (if available) and one responsibility inferred from headline.
-- analysis.value_proposition explicitly links responsibility + company_context + concrete operational improvement.
-- Messages follow step objectives and progressively evolve without generic filler.`;
-}
-
-function buildAnalysisUserPrompt(
-  prospectData: ProspectData,
-  companyContext: string,
-  tovDescription: string,
-  sequenceLength: number,
-  factsBlock: string
-): string {
-  return `Create an analysis plan for a ${sequenceLength}-message LinkedIn outreach sequence.
-
-${factsBlock}
-
-COMPANY CONTEXT:
-${companyContext}
-
-TONE OF VOICE:
-${tovDescription}
-
-Return ONLY JSON with analysis + angles + step_objectives.
-- Provide at least ${Math.min(Math.max(sequenceLength, 2), 5)} angles.
-- Provide exactly ${sequenceLength} step objectives.
-- Keep all claims grounded in provided facts.`;
-}
-
-function buildUserPrompt(
-  prospectData: ProspectData,
-  companyContext: string,
-  tovDescription: string,
-  sequenceLength: number,
-  factsBlock: string,
-  analysisPlan?: AnalysisPlan
-): string {
-  const analysisGuidance = analysisPlan
-    ? `ANALYSIS PLAN (must inform your output):
-${JSON.stringify(
-        {
-          analysis: analysisPlan.analysis,
-          angles: analysisPlan.angles,
-          step_objectives: analysisPlan.stepObjectives,
-        },
-        null,
-        2
-      )}`
-    : 'ANALYSIS PLAN: Not provided. Infer from facts and constraints.';
-
-  return `Generate a ${sequenceLength}-message LinkedIn direct message sequence for this prospect.
-
-PROSPECT INFORMATION:
-- Name: ${prospectData.fullName}
-- Headline: ${prospectData.headline}
-- Company: ${prospectData.company}
-- Profile Data (JSON): ${JSON.stringify(prospectData.profileData)}
-
-${factsBlock}
-
-COMPANY CONTEXT (sender):
-${companyContext}
-
-TONE OF VOICE:
-${tovDescription}
-
-SEQUENCE REQUIREMENTS:
-- Generate exactly ${sequenceLength} LinkedIn DMs.
-- Each message must be a single message (no subject line, no email structure, no signature).
-- Keep step 1 under 60 words.
-- Make all messages conversational and natural, avoiding corporate buzzwords and over-polished marketing tone.
-- Strong personalization: explicitly reference details from the prospect's role, headline, company, and experience where relevant.
-- Tie the company context and value proposition directly to what this prospect likely cares about in their role.
-- Avoid generic outreach templates and clichés.
-- Build a natural progression across the sequence (e.g., initial connection-style message, then context-building, then value-driven follow-ups).
-- In analysis.prospect_insights, include at least one explicit skill from profileData.skills when available and one responsibility inferred from the headline.
-- In analysis.value_proposition, explicitly connect responsibilities + company context + a concrete operational improvement.
-
-${analysisGuidance}
-
-OUTPUT QUALITY CHECK (SILENT):
-- Ensure claims are grounded in facts.
-- Ensure response varies by this specific prospect data.
-- Ensure no unsupported generic claims.
-
-Return ONLY the JSON object as specified in the system prompt. Do not add any markdown or commentary.`;
-}
-
-function buildRepairSystemPrompt(sequenceLength: number): string {
-  return `You are fixing a JSON output for quality compliance.
-
-Return ONLY valid JSON in this exact structure:
-{
-  "analysis": {
-    "prospect_insights": "...",
-    "personalization_hooks": ["...", "..."],
-    "value_proposition": "..."
-  },
-  "messages": [
-    { "step": 1, "message": "...", "reasoning": "..." }
-  ],
-  "confidence": 0.85
-}
-
-Hard constraints:
-- Exactly ${sequenceLength} messages with sequential steps starting at 1.
-- Keep step 1 under 60 words.
-- No markdown, no extra text, no raw chain-of-thought.
-- Keep reasoning concise and field-limited.
-- Preserve strong grounding in provided facts and company context.`;
-}
-
-function buildRepairUserPrompt(
-  currentResponse: Record<string, any>,
-  qualityIssues: string[],
-  prospectData: ProspectData,
-  companyContext: string,
-  tovDescription: string,
-  sequenceLength: number,
-  factsBlock: string,
-  analysisPlan?: AnalysisPlan
-): string {
-  const analysisPlanText = analysisPlan
-    ? JSON.stringify(
-        {
-          analysis: analysisPlan.analysis,
-          angles: analysisPlan.angles,
-          step_objectives: analysisPlan.stepObjectives,
-        },
-        null,
-        2
-      )
-    : 'n/a';
-
-  return `Fix the following JSON output to resolve quality issues while keeping the same overall intent.
-
-QUALITY ISSUES TO FIX:
-${qualityIssues.map((issue, index) => `${index + 1}. ${issue}`).join('\n')}
-
-CURRENT OUTPUT JSON:
-${JSON.stringify(currentResponse, null, 2)}
-
-PROSPECT FACTS:
-${factsBlock}
-
-PROSPECT INFORMATION:
-- Name: ${prospectData.fullName}
-- Headline: ${prospectData.headline}
-- Company: ${prospectData.company}
-- Profile Data (JSON): ${JSON.stringify(prospectData.profileData)}
-
-COMPANY CONTEXT:
-${companyContext}
-
-TONE OF VOICE:
-${tovDescription}
-
-TARGET MESSAGE COUNT:
-${sequenceLength}
-
-ANALYSIS PLAN:
-${analysisPlanText}
-
-Return ONLY corrected JSON.`;
+/** Extract meaningful content words from text (for restatement detection) */
+function extractContentWords(text: string): Set<string> {
+  const filler = new Set([
+    ...STOPWORDS, 'your', 'team', 'often', 'these', 'that', 'they', 'them',
+    'which', 'when', 'what', 'where', 'many', 'most', 'some', 'more',
+    'also', 'just', 'like', 'have', 'been', 'will', 'would', 'could',
+    'should', 'does', 'didn', 'aren', 'isn', 'wasn', 'hasn', 'don',
+    'can', 'not', 'very', 'much', 'well', 'even', 'still', 'come',
+    'before', 'after', 'without', 'leading',
+  ]);
+  return new Set(
+    text.toLowerCase()
+      .split(/[^a-z]+/)
+      .filter((w) => w.length >= 4 && !filler.has(w))
+  );
 }
 
 export { PROMPT_VERSION, MODEL };

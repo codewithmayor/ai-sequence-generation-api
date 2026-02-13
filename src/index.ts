@@ -8,6 +8,7 @@ const PORT = process.env.PORT || 3000;
 
 // Middleware
 app.use(express.json());
+app.set('json spaces', 2);
 
 // Root info endpoint for browsers
 app.get('/', (req, res) => {

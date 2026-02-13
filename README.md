@@ -108,8 +108,8 @@ Data flow:
 
 `LinkedIn URL -> Profile Analysis -> TOV Translation -> AI Generation -> Database Storage`
 
-LinkedIn profile enrichment is deterministic mock data derived from the URL slug; company names are generated from the LinkedIn handle for consistency in demos, not as real-world company resolution logic.
-In production, this would be replaced with official LinkedIn data access or a compliant enrichment provider, with caching, rate limiting, and retry policies.
+In a production environment, I would integrate with an official LinkedIn partner API or a compliant enrichment provider such as People Data Labs or Proxycurl.
+For this exercise, I implemented deterministic mock enrichment derived from the LinkedIn slug to simulate realistic profile data while keeping the system architecture production-ready and legally safe.
 
 ### Framework And Execution Tradeoffs
 

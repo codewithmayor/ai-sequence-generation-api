@@ -65,7 +65,7 @@ The schema is designed around one generation lifecycle:
 - **Prospect**: stores LinkedIn anchor data (`linkedinUrl`, `fullName`, `headline`, `company`, `profileData`)
 - **TovConfig**: stores normalized TOV numeric settings + translated description
 - **MessageSequence**: stores campaign output (`messages`, `analysis`, `confidence`) and request context
-- **AIGeneration**: stores model metadata, token usage, estimated cost, and raw AI response
+- **AIGeneration**: stores model metadata, token usage, prompt version, estimated cost, and raw AI response
 
 Why this shape:
 

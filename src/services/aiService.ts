@@ -14,7 +14,7 @@ if (!apiKey) {
 
 const openai = apiKey ? new OpenAI({ apiKey }) : null;
 
-const PROMPT_VERSION = 'v5.2';
+const PROMPT_VERSION = 'v5.3';
 const MODEL = 'gpt-4o-mini';
 const TEMPERATURE = 0.5;
 
@@ -264,9 +264,9 @@ SCOPE:
 RULES:
 - LinkedIn DMs only. No subject lines, signatures, placeholders.
 - Step 1: "Hi [Name]," + observation (<60 words). Steps 2+: no re-greeting.
-- Each step = new narrative layer. Spotlight step must reference company_context.
+- Each step = new narrative layer. Spotlight and Improvement steps MUST use specific terms from company_context — not generic restatements. If context says "manual enrichment workflows", write "manual enrichment" in the message.
 - No invented stats. No numeric claims. Hooks must reference real prospect data.
-- BANNED: "Would you be open to a brief chat", "Would love to connect", "I imagine", "I came across your profile", "I've been following", "operational workflows", "save your team time", "innovative approach".
+- BANNED: "Would you be open to a brief chat", "Would love to connect", "I imagine", "I came across your profile", "I've been following", "operational workflows", "save your team time", "innovative approach", "wasting valuable time and resources".
 - Reasoning: max 25 words. Angle = layer name, not friction name.
 
 ${buildStepProgression(sequenceLength)}
@@ -315,6 +315,13 @@ function buildUserPrompt(
     ? `\nTARGET PERSONA: ${strategy.targetPersona}. The prospect's profile is ${prospectData.roleCategory}, but the company_context is most relevant to ${strategy.targetPersona} frictions. Frame the outreach through ${strategy.targetPersona}-relevant pain points while personalizing with the prospect's actual skills and experience.`
     : '';
 
+  // Extract distinctive keywords from company_context — model MUST reference these.
+  // This prevents generic framing and ensures different contexts produce different messages.
+  const contextKeywords = extractContextKeywords(companyContext);
+  const contextKeywordBlock = contextKeywords.length > 0
+    ? `\nCONTEXT KEYWORDS (use at least 2 of these verbatim in messages): ${contextKeywords.join(', ')}`
+    : '';
+
   return `Generate ${sequenceLength} LinkedIn DMs for this prospect.
 
 PROSPECT:
@@ -326,7 +333,7 @@ PROSPECT:
 - Responsibilities: ${responsibilities}
 - Experience: ${experience}${personaSignal}
 
-COMPANY CONTEXT (what we sell): ${companyContext}
+COMPANY CONTEXT (what we sell): ${companyContext}${contextKeywordBlock}
 
 TONE: ${tovDescription}
 
@@ -335,8 +342,9 @@ ${frictionBlock}
 GROUNDING:
 - prospect_insights: reference one skill + one headline responsibility. Max 3 sentences.
 - personalization_hooks: exactly 2. Must reference actual data (skill name, company, headline keyword).
-- value_proposition: how our product reduces the chosen friction. Reference company capability + prospect role.
+- value_proposition: how our product reduces the chosen friction. Use specific terms from company_context — not generic restatements.
 - Pick ONE friction. Build ${sequenceLength} progressive layers. Last message = company_context + CTA.
+- Spotlight + Improvement steps MUST reference specific company_context terms (e.g. if context says "reduce manual enrichment workflows", say "manual enrichment" — not just "qualify prospects").
 
 Return ONLY JSON.`;
 }
@@ -388,7 +396,7 @@ function validateOutputStructure(parsed: any, sequenceLength: number): void {
 function validateContentQuality(
   parsed: Record<string, any>,
   prospectData: ProspectData,
-  _companyContext: string
+  companyContext: string
 ): string[] {
   const issues: string[] = [];
   const analysis = (parsed.analysis || {}) as Record<string, any>;
@@ -474,6 +482,18 @@ function validateContentQuality(
     }
   }
 
+  // --- company_context keyword coverage ---
+  const ctxKeywords = extractContextKeywords(companyContext);
+  if (ctxKeywords.length > 0) {
+    const allMessageText = parsed.messages.map((m: any) => str(m.message)).join(' ') + ' ' + valueProp;
+    const matched = ctxKeywords.filter((kw) => allMessageText.includes(kw.toLowerCase()));
+    if (matched.length === 0) {
+      issues.push('no messages reference specific company_context terms — output may be too generic');
+    } else if (matched.length < 2 && ctxKeywords.length >= 3) {
+      issues.push(`only ${matched.length} context keyword(s) referenced (expected ≥2): ${matched.join(', ')}`);
+    }
+  }
+
   // --- restatement detection ---
   for (let i = 1; i < parsed.messages.length; i++) {
     const prevWords = extractContentWords(str(parsed.messages[i - 1].message));
@@ -498,6 +518,19 @@ function validateContentQuality(
 // ---------------------------------------------------------------------------
 
 const TEXT_REPLACEMENTS: [RegExp, string][] = [
+  // Grammar fixes (common model typos)
+  [/\bcan reduces\b/gi, 'can reduce'],
+  [/\bcan improves\b/gi, 'can improve'],
+  [/\bcan ensures\b/gi, 'can ensure'],
+  [/\bcan eliminates\b/gi, 'can eliminate'],
+  [/\bwhich helps? reduces?\b/gi, 'which reduces'],
+  [/\bthis means? fewer\b/gi, 'this means fewer'],
+  // Borderline domain phrasing → upstream friction framing
+  [/\bfewer disruptions (?:for|to) your (?:data )?pipelines?\b/gi, 'fewer ad-hoc requests reaching your team'],
+  [/\bdisruptions? (?:for|to) your (?:data )?pipelines?\b/gi, 'noise reaching your team from unqualified prospects'],
+  [/\bprotect(?:s|ing)? your (?:data )?pipelines?\b/gi, 'shields your team from unqualified upstream noise'],
+  [/\bfewer disruptions (?:for|to) your (?:core |critical )?(?:infrastructure|systems?)\b/gi, 'fewer unqualified requests pulling your team off planned work'],
+  // Abstract language → concrete framing
   [/\bstreamlining\s+/gi, 'reducing '],
   [/\bstreamlines?\s+the\b/gi, 'reduces friction in'],
   [/\bstreamlines?\s/gi, 'reduces '],
@@ -508,6 +541,9 @@ const TEXT_REPLACEMENTS: [RegExp, string][] = [
   [/\bcan disrupt workflow significantly\b/gi, 'pulls your team off planned work'],
   [/\bsave your team time\b/gi, 'free your team from unqualified noise'],
   [/\bwaste valuable time\b/gi, 'cost your team cycles on deals that never close'],
+  [/\bwasting valuable time and resources\b/gi, 'spending cycles on prospects that never close'],
+  [/\bwasted time and effort\b/gi, 'cycles lost to prospects that were never a fit'],
+  [/\bwasted time and resources\b/gi, 'effort spent on prospects that go nowhere'],
 ];
 
 function sanitizeText(text: string): string {
@@ -640,6 +676,58 @@ function hasNamedWorkflow(text: string): boolean {
 function isSales(roleCategory: string): boolean {
   const r = roleCategory.toLowerCase();
   return r.includes('sales') || r.includes('revenue') || r.includes('business development');
+}
+
+/**
+ * Extract distinctive keywords from company_context for prompt injection.
+ * These are the terms the model MUST reference — they differentiate one context from another.
+ * Strips common filler words and returns only signal-bearing terms.
+ */
+function extractContextKeywords(companyContext: string): string[] {
+  const CONTEXT_STOPWORDS = new Set([
+    'we', 'our', 'help', 'helps', 'that', 'the', 'and', 'for', 'with',
+    'this', 'from', 'their', 'more', 'also', 'can', 'are', 'have',
+    'teams', 'team', 'companies', 'company', 'build', 'builds',
+    'so', 'to', 'by', 'of', 'in', 'an', 'a', 'is', 'it',
+  ]);
+
+  // Extract multi-word phrases first (2-3 word combinations that carry meaning)
+  const phrases: string[] = [];
+  const contextLower = companyContext.toLowerCase();
+  const SIGNAL_PHRASES = [
+    'manual enrichment', 'enrichment workflows', 'qualify prospects',
+    'sales teams', 'outbound automation', 'prospect data',
+    'security reviews', 'security questionnaires',
+    'qualification process', 'lead qualification', 'ICP matching',
+    'pipeline velocity', 'targeting precision', 'demo qualification',
+    'escalation volume', 'inbound triage', 'handoff quality',
+    'reduce manual', 'automate sales', 'personalization at scale',
+  ];
+  for (const phrase of SIGNAL_PHRASES) {
+    if (contextLower.includes(phrase.toLowerCase())) {
+      phrases.push(phrase);
+    }
+  }
+
+  // Extract single distinctive words
+  const words = companyContext
+    .toLowerCase()
+    .split(/[^a-z0-9-]+/)
+    .filter((w) => w.length >= 4 && !CONTEXT_STOPWORDS.has(w));
+
+  // Combine: phrases first (higher signal), then unique single words
+  const seen = new Set(phrases.map((p) => p.toLowerCase()));
+  const singles = words.filter((w) => {
+    if (seen.has(w)) return false;
+    // Skip words already covered by a phrase
+    for (const p of phrases) {
+      if (p.toLowerCase().includes(w)) return false;
+    }
+    seen.add(w);
+    return true;
+  });
+
+  return [...phrases, ...singles].slice(0, 8);
 }
 
 function extractSignalKeywords(text: string): string[] {

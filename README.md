@@ -3,6 +3,11 @@
 You hand this service a LinkedIn URL and some context about your company, and it hands you back a realistic, insight-driven outreach sequence.  
 No toy examples, no hard-coded JSON. This is a production-minded backend that treats AI like an infrastructure dependency, not a magic trick.
 
+## Live Demo
+
+- Base URL: https://ai-sequence-generation-api-production.up.railway.app/
+- Health check: https://ai-sequence-generation-api-production.up.railway.app/health
+
 ## Architecture Overview
 
 The app is intentionally small but not shallow. It follows a layered structure that's easy to reason about under operational pressure:

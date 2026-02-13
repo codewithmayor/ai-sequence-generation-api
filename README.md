@@ -111,6 +111,15 @@ Data flow:
 In a production environment, I would integrate with an official LinkedIn partner API or a compliant enrichment provider such as People Data Labs or Proxycurl.
 For this exercise, I implemented deterministic mock enrichment derived from the LinkedIn slug to simulate realistic profile data while keeping the system architecture production-ready and legally safe.
 
+### How Mock LinkedIn Parsing Works
+
+- Extract handle from `linkedin.com/in/<handle>` and use it as the deterministic seed.
+- Generate `fullName` from slug segments (capitalized words from the handle).
+- Generate `company` from a slug segment + deterministic suffix selection via hash modulo (no randomness).
+- Infer role template from handle keywords (`data`, `product`, `devops`, etc.) with hash-based fallback when no keyword matches.
+- Build `headline`, `skills`, `summary`, `experience`, and `education` from deterministic selectors based on the same handle seed.
+- Same LinkedIn URL always yields the same mock profile; different handles yield varied profiles.
+
 ### Framework And Execution Tradeoffs
 
 - **Why Express over Fastify?** In this prototype, end-to-end latency is dominated by the AI call. Express provided the fastest path to stable routing and middleware with minimal setup.

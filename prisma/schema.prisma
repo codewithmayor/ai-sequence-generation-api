@@ -1,0 +1,81 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Prospect {
+  id          String   @id @default(uuid())
+  linkedinUrl String   @unique
+  fullName    String?
+  headline    String?
+  company     String?
+  profileData Json     // JSONB for flexible LinkedIn profile data
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relations
+  sequences   MessageSequence[]
+
+  @@index([linkedinUrl])
+  @@map("prospects")
+}
+
+model TovConfig {
+  id          String   @id @default(uuid())
+  formality   Float    // 0-1 range
+  warmth      Float    // 0-1 range
+  directness  Float    // 0-1 range
+  description String   // Human-readable translated version
+  createdAt   DateTime @default(now())
+
+  // Relations
+  sequences   MessageSequence[]
+
+  @@map("tov_configs")
+}
+
+model MessageSequence {
+  id             String   @id @default(uuid())
+  prospectId     String
+  tovConfigId    String
+  companyContext String
+  sequenceLength Int
+  messages       Json     // JSONB array of message objects
+  analysis       Json     // JSONB for AI analysis
+  confidence     Float
+  createdAt      DateTime @default(now())
+
+  // Relations
+  prospect       Prospect    @relation(fields: [prospectId], references: [id], onDelete: Cascade)
+  tovConfig      TovConfig   @relation(fields: [tovConfigId], references: [id], onDelete: Restrict)
+  aiGenerations  AIGeneration[]
+
+  @@map("message_sequences")
+  @@index([prospectId, tovConfigId, companyContext, sequenceLength])
+}
+
+model AIGeneration {
+  id              String   @id @default(uuid())
+  sequenceId      String
+  model           String   // e.g., "gpt-4o-mini"
+  promptVersion   String   // Version identifier for prompt experimentation
+  promptTokens    Int
+  completionTokens Int
+  totalTokens     Int
+  estimatedCost   Float    // USD estimate
+  rawResponse     Json     // JSONB for raw API response
+  thinking        Json?    // JSONB for any thinking/reasoning data
+  createdAt       DateTime @default(now())
+
+  // Relations
+  sequence        MessageSequence @relation(fields: [sequenceId], references: [id], onDelete: Cascade)
+
+  @@map("ai_generations")
+}

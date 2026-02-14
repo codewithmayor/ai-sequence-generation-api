@@ -138,7 +138,19 @@ The system logs structured diagnostics at every decision point — none of this 
 - **Low alignment warnings** — if `alignmentScore < 0.25`, a warning is emitted: `"Low contextual alignment between prospect role and company_context"`. The system knows when the pitch and persona don't match well.
 - **Quality issues** — post-generation validators log grounding issues (domain overreach, generic filler, restatement detection) but accept the output. No repair pass, no double cost.
 - **Idempotency events** — cache hits and prompt-version mismatches are logged with sequence IDs.
-- **Strategy persistence** — the full strategy (`prospectRole`, `targetPersona`, `capabilityTags`, `activeWorkflows`, `alignmentScore`) is stored in the `thinking` JSONB field on `AIGeneration`, making every persona derivation auditable after the fact.
+- **Strategy persistence** — the full strategy is stored in the `thinking` JSONB field on `AIGeneration`, making every persona derivation auditable after the fact:
+  ```json
+  {
+    "analysis": { /* AI analysis output */ },
+    "strategy": {
+      "prospectRole": "Engineering",
+      "targetPersona": "Security",
+      "capabilityTags": ["qualification", "filtering"],
+      "activeWorkflows": ["security-questionnaires", "compliance-checks"],
+      "alignmentScore": 0.85
+    }
+  }
+  ```
 
 This is product thinking: the system doesn't just generate — it knows when it's on shaky ground and leaves a trail.
 
